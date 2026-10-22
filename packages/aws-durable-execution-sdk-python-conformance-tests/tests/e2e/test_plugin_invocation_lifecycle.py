@@ -20,7 +20,7 @@ from aws_durable_execution_sdk_python_testing import DurableFunctionTestRunner
 HANDLERS_DIR = Path(__file__).resolve().parents[2] / "handlers"
 sys.path.insert(0, str(HANDLERS_DIR))
 
-from plugin.plugin_invocation_lifecycle import LifecyclePlugin, greet, handler  # noqa: E402
+from plugin.plugin_invocation_lifecycle import LifecyclePluginFactory, greet, handler  # noqa: E402
 
 
 def _lifecycle_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -58,7 +58,7 @@ def test_lifecycle_and_greeting_share_structured_logging(
 def test_replay_logs_hooks_without_repeating_the_greeting(
     caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    @durable_execution(plugins=[LifecyclePlugin()])
+    @durable_execution(plugins=[LifecyclePluginFactory()])
     def handler_with_wait(event: str, context: DurableContext) -> str:
         result = context.step(greet(event))
         context.wait(Duration.from_seconds(10))
