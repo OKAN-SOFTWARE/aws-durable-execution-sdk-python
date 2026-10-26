@@ -284,7 +284,13 @@ class MicrovmWorkerListener:
 
     A second delivery of a callback ID is answered like the first and
     ignored, while that job runs and after it ended. The listener remembers
-    the last 1,000 finished callback IDs.
+    the last 1,000 finished callback IDs. A second delivery of a finished
+    job gets this answer in every state, because it starts nothing. A
+    second delivery of a known job gets it after the ``terminate`` hook too,
+    because that hook fails a running job's callback. A second delivery of a
+    running job during a suspend refusal gets HTTP 503, as a new job does.
+    The running job can freeze with the MicroVM. The 503 makes the durable
+    function check the state and resume the MicroVM.
 
     A document that does not match the contract gets HTTP 400. If the
     document still names a callback, the listener fails that callback. So
@@ -301,9 +307,9 @@ class MicrovmWorkerListener:
     3. When the idle time ends, the listener calls SuspendMicrovm with the
        ``run`` hook's MicroVM ID. The call returns before the MicroVM
        freezes.
-    4. From the moment the idle time ends, the listener answers every job
-       with HTTP 503 and does not start it. A job accepted then would freeze
-       with the MicroVM. After a 503, the durable function resumes the
+    4. From the moment the idle time ends, the listener answers every new
+       job with HTTP 503 and does not start it. A job accepted then would
+       freeze with the MicroVM. After a 503, the durable function resumes the
        MicroVM and delivers the job again.
     5. The refusal ends when the ``resume`` hook arrives, or 30 seconds after
        the call returned. The idle time then starts again.
@@ -330,14 +336,15 @@ class MicrovmWorkerListener:
        arrives after it. A ``suspend`` hook whose refusal is still in
        effect when the call ends is the exception, as in item 6. Its
        refusal stays, and the idle time starts when it ends.
-       The default client retries a throttle. So a throttle from it usually
-       ends as an unknown outcome, as in item 8. A throttle is refused for
-       now only from a caller's client that does not retry it.
+       The default client makes one attempt. So a throttle from it is
+       refused for now. A caller's client that retries a throttle turns it
+       into an unknown outcome, as in item 8.
     8. A call whose outcome is unknown, such as a timeout, a conflict, a
        server error, or an error after a retried attempt, is handled like a
        successful call. The service may have suspended the MicroVM anyway.
-       No attempt of the call starts after 10 seconds. An attempt already in
-       flight runs until it ends, and the refusal lasts at least until then.
+       No attempt of the call starts after 10 seconds, and none starts
+       after a ``resume`` hook. An attempt already in flight runs until it
+       ends, and the refusal lasts at least until then.
        A `resume` hook during the call, or the end of a `suspend` hook's 30
        seconds during the call, has already ended the refusal. The worker
        then accepts jobs at once, and tries the call again one idle time
@@ -360,7 +367,8 @@ class MicrovmWorkerListener:
 
     - ``suspend``: the listener answers HTTP 200 at once, because a suspend
       hook that runs past its timeout terminates the MicroVM. It then
-      refuses jobs with HTTP 503, as after its own suspend, until the
+      refuses new jobs, and second deliveries of running jobs, with HTTP
+      503, as after its own suspend, until the
       ``resume`` hook or for 30 seconds. Running jobs freeze with the
       MicroVM. A ``run`` hook job that arrives during the refusal starts when
       the refusal ends, because the durable function cannot deliver it
@@ -370,8 +378,8 @@ class MicrovmWorkerListener:
       :class:`MicrovmTerminatedError`. It answers HTTP 200 when the reports
       end, or after 5 seconds. The answer also waits for jobs that report
       their own outcome, for ``run`` hook requests in flight, and for the
-      failure reports of invalid requests. From then on it refuses jobs with
-      HTTP 503, and fails the callback of a ``run`` hook job instead of
+      failure reports of invalid requests. From then on it refuses new jobs
+      with HTTP 503, and fails the callback of a ``run`` hook job instead of
       starting it.
 
     The listener acts on these two hooks, and on ``resume``, only when the
@@ -454,6 +462,19 @@ class MicrovmWorkerListener:
         # worker's own that the service rejected must not end a refusal that
         # a suspend hook started meanwhile.
         self._suspend_hooks = 0
+        # Counts the resume hooks from Lambda. Each one ends the refusal, so
+        # a job can run from then on. A SuspendMicrovm attempt after it would
+        # freeze that job. So the call's before-send handler starts no
+        # attempt once this count has changed. The handler reads the count
+        # without the lock: an int read is atomic, and the handler then
+        # waits for no listener lock inside botocore.
+        self._resume_hooks = 0
+        # The MicroVM ID of the SuspendMicrovm call in flight. It is set when
+        # the idle time ends, and cleared when the call returns or the first
+        # resume hook during the call arrives. That hook logs that it stops
+        # the call. So a second resume hook during the same call logs
+        # nothing.
+        self._stoppable_suspend: str | None = None
         # SuspendMicrovm calls in flight. idle() waits for them. At most one
         # runs at a time.
         self._suspend_calls = 0
@@ -511,7 +532,11 @@ class MicrovmWorkerListener:
                 idle, once per suspend. It never closes a client that this
                 function returns. Defaults to a client of its own per
                 suspend, from the default credential chain. The listener
-                closes that client after the call. A client that retries
+                closes that client after the call. The listener stops the
+                client's attempts once a ``resume`` hook arrived. Give the
+                client one attempt, as the default client has. A retry
+                that starts before the ``resume`` hook arrives can still
+                suspend the MicroVM after it resumed. A client that retries
                 must report its retries in ``ResponseMetadata.RetryAttempts``
                 of the error that it raises. The listener otherwise counts a
                 retried call as a first attempt. An earlier attempt of that
@@ -708,13 +733,28 @@ class MicrovmWorkerListener:
 
         A resume without a job would otherwise leave the MicroVM running
         until the next job ends. Returns the deferred run hook jobs,
-        registered. The caller starts them after the answer.
+        registered. The caller starts them after the answer. A
+        SuspendMicrovm call in flight starts no attempt after this hook.
+        The first such hook logs that it stops the call.
         """
         with self._locked():
+            self._resume_hooks += 1
+            stopped = self._stoppable_suspend
+            self._stoppable_suspend = None
             if self._suspending:
-                return self._end_suspending()
-            self._start_idle_time()
-            return []
+                deferred = self._end_suspending()
+            else:
+                self._start_idle_time()
+                deferred = []
+        # The caller of the listener passes the logger. So the line is
+        # written after the lock is released. botocore cannot cancel an
+        # attempt in flight. So the call stops at its next attempt.
+        if stopped is not None:
+            self._logger.info(
+                "stopping the suspend call: the MicroVM resumed during it",
+                extra={"microvmId": stopped},
+            )
+        return deferred
 
     def _handle_terminate_hook(self, exchange: _Exchange) -> None:
         """Fail the callback of every running job, then answer the hook.
@@ -951,11 +991,37 @@ class MicrovmWorkerListener:
                 # arrives.
                 self._microvm_id = request.microvm_id
             microvm_id = self._microvm_id
-            terminating = self._terminating
-            suspending = self._suspending
-            duplicate = self._is_known(job.callback_id)
-            if not (terminating or suspending or duplicate):
+            # A known callback ID gets one of three answers:
+            #
+            # 1. An ID in _finished gets 202 in every state. Its job has
+            #    ended, and the answer starts nothing. A 503 would make the
+            #    durable function resume the MicroVM only to get this answer.
+            # 2. A known ID gets 202 while the MicroVM terminates. The
+            #    terminate hook fails a running job's callback. So the
+            #    durable function learns the outcome from the callback.
+            # 3. An ID in _jobs gets 503 during a suspend refusal, as a new
+            #    job does. The running job can freeze with the MicroVM. A
+            #    202 would end the delivery, and nothing would resume the
+            #    MicroVM. So the job would wait for its heartbeat timeout or
+            #    its timeout. The 503 makes the durable function check the
+            #    state, resume the MicroVM, and deliver the job again.
+            may_freeze = (
+                job.callback_id in self._jobs
+                and self._suspending
+                and not self._terminating
+            )
+            duplicate = self._is_known(job.callback_id) and not may_freeze
+            terminating = not duplicate and self._terminating
+            suspending = not duplicate and self._suspending
+            if not (duplicate or terminating or suspending):
                 self._register_job(job.callback_id, request.region)
+        if duplicate:
+            exchange.respond(202, {})
+            self._logger.warning(
+                "duplicate job ignored",
+                extra={"microvmId": microvm_id, "callbackId": job.callback_id},
+            )
+            return
         if terminating or suspending:
             # Terminating: the MicroVM is about to end, and the job could not
             # finish. Suspending: the MicroVM is about to freeze. The durable
@@ -966,13 +1032,6 @@ class MicrovmWorkerListener:
                 extra={"microvmId": microvm_id, "callbackId": job.callback_id},
             )
             exchange.respond(503, {"error": f"the MicroVM is {state}"})
-            return
-        if duplicate:
-            exchange.respond(202, {})
-            self._logger.warning(
-                "duplicate job ignored",
-                extra={"microvmId": microvm_id, "callbackId": job.callback_id},
-            )
             return
         # The thread starts before the answer. A thread that cannot start
         # raises, and the caller gets HTTP 500, which the durable function
@@ -1438,10 +1497,14 @@ class MicrovmWorkerListener:
             # thread starts, while the client is created, or during the call.
             # Each path that ends the refusal compares with this count.
             hooks_before = self._suspend_hooks
+            # A resume hook from here on ends the refusal. The call then
+            # starts no further attempt.
+            resumes_before = self._resume_hooks
+            self._stoppable_suspend = auto_suspend.microvm_id
         try:
             threading.Thread(
                 target=self._suspend_self,
-                args=(auto_suspend, hooks_before, waited_seconds),
+                args=(auto_suspend, hooks_before, resumes_before, waited_seconds),
                 name="microvm-suspend",
                 daemon=True,
             ).start()
@@ -1458,10 +1521,16 @@ class MicrovmWorkerListener:
             self._launch_deferred(deferred)
 
     def _suspend_self(
-        self, auto_suspend: _AutoSuspend, hooks_before: int, waited_seconds: float
+        self,
+        auto_suspend: _AutoSuspend,
+        hooks_before: int,
+        resumes_before: int,
+        waited_seconds: float,
     ) -> None:
         try:
-            self._call_suspend(auto_suspend, hooks_before, waited_seconds)
+            self._call_suspend(
+                auto_suspend, hooks_before, resumes_before, waited_seconds
+            )
         finally:
             with self._locked():
                 self._suspend_call_ended()
@@ -1484,13 +1553,19 @@ class MicrovmWorkerListener:
         a resume hook, a job, or a refusal for now asked for during it. The
         caller holds the lock through :meth:`_locked`."""
         self._suspend_calls -= 1
+        # The thread or the client could fail before the call was sent.
+        self._stoppable_suspend = None
         if self._idle_after_call:
             self._idle_after_call = False
             self._start_idle_time(after_refusal=self._idle_after_call_floor)
         self._changed.notify_all()
 
     def _call_suspend(
-        self, auto_suspend: _AutoSuspend, hooks_before: int, waited_seconds: float
+        self,
+        auto_suspend: _AutoSuspend,
+        hooks_before: int,
+        resumes_before: int,
+        waited_seconds: float,
     ) -> None:
         target = auto_suspend.microvm_id
         fields = {"microvmId": target}
@@ -1530,7 +1605,7 @@ class MicrovmWorkerListener:
         # close().
         unknown_described: object | None = None
         try:
-            suspend_microvm(client, target, SUSPEND_CALL_TIMEOUT_SECONDS)
+            self._send_suspend(client, target, resumes_before)
         except Exception as error:  # noqa: BLE001
             outcome = classify_suspend_error(error)
             # describe() calls str(error). A client from
@@ -1544,7 +1619,12 @@ class MicrovmWorkerListener:
                 # A timeout, a conflict, a server error, or an error after a
                 # retried attempt does not show whether the service suspended
                 # the MicroVM. So the refusal continues, as after a successful
-                # call. The block after the client is closed acts on it.
+                # call. The block after the client is closed acts on it. A
+                # resume hook can stop any attempt, the first one included. An
+                # earlier attempt, if there was one, may have suspended the
+                # MicroVM. That resume hook has already ended the refusal. So
+                # that block starts a grace period only for a suspend hook
+                # that came after the resume.
                 unknown_described = described
             else:
                 deferred = []
@@ -1591,6 +1671,27 @@ class MicrovmWorkerListener:
                 SuspendOutcome.UNKNOWN, unknown_described, target, hooks_before
             )
         self._logger.warning(message, extra=extra)
+
+    def _send_suspend(
+        self, client: LambdaMicrovmsClient, target: str, resumes_before: int
+    ) -> None:
+        """Make the SuspendMicrovm call. Start no attempt after a resume hook
+        that arrived since the idle time ended."""
+        try:
+            # The before-send handler calls resumed() inside botocore, in
+            # this thread. It reads one int without the lock. So it runs no
+            # code of the caller, and waits for no listener lock.
+            suspend_microvm(
+                client,
+                target,
+                SUSPEND_CALL_TIMEOUT_SECONDS,
+                resumed=lambda: self._resume_hooks != resumes_before,
+            )
+        finally:
+            # The call has returned. A resume hook from now on stops nothing,
+            # so it logs no stop.
+            with self._lock:
+                self._stoppable_suspend = None
 
     def _failed_call_log(
         self,
