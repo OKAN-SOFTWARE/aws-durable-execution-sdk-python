@@ -153,6 +153,20 @@ class InvalidParameterValueException(AwsApiException):
         return {"Type": "InvalidParameterValueException", "message": self.message}
 
 
+class ValidationException(AwsApiException):
+    """Service-model constraint error returned by CheckpointDurableExecution."""
+
+    http_status_code = 400
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+    def to_dict(self) -> dict[str, Any]:
+        # Botocore recognizes the unmodeled ValidationException via __type.
+        return {"__type": "ValidationException", "message": self.message}
+
+
 class ResourceNotFoundException(AwsApiException):
     """Exception for resource not found errors."""
 

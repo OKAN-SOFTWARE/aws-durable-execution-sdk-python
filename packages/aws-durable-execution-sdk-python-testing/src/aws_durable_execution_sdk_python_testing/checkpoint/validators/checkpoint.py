@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, ClassVar
 
 from aws_durable_execution_sdk_python.lambda_service import (
@@ -43,6 +44,7 @@ from aws_durable_execution_sdk_python_testing.child_dispatcher import (
 )
 from aws_durable_execution_sdk_python_testing.exceptions import (
     InvalidParameterValueException,
+    ValidationException,
 )
 
 
@@ -52,6 +54,9 @@ if TYPE_CHECKING:
     from aws_durable_execution_sdk_python_testing.execution import Execution
 
 MAX_ERROR_PAYLOAD_SIZE_BYTES = 1048576
+SUBTYPE_PATTERN = "[a-zA-Z0-9-_]+"
+_SUBTYPE_RE = re.compile(SUBTYPE_PATTERN)
+_MAX_VALIDATION_ERRORS = 10
 
 
 class CheckpointValidator:
@@ -74,11 +79,50 @@ class CheckpointValidator:
         if not updates:
             return
 
+        # Reject service-model violations before any stateful validation or writes.
+        CheckpointValidator._validate_subtypes(updates)
         CheckpointValidator._validate_conflicting_execution_update(updates)
         CheckpointValidator._validate_parent_id_and_duplicate_id(updates, execution)
 
         for update in updates:
             CheckpointValidator._validate_operation_update(update, execution)
+
+    @staticmethod
+    def _validate_subtypes(updates: list[OperationUpdate]) -> None:
+        """Validate SubType constraints before checkpoint state is mutated.
+
+        The service lists up to ten errors in update order. The empty string
+        violates both the minimum length and the required pattern.
+        """
+        errors: list[str] = []
+        for index, update in enumerate(updates, start=1):
+            sub_type = update.sub_type
+            if sub_type is None:
+                continue
+            prefix = (
+                f"Value '{sub_type}' at 'updates.{index}.member.subType' "
+                "failed to satisfy constraint:"
+            )
+            if len(sub_type) < 1:
+                errors.append(
+                    f"{prefix} Member must have length greater than or equal to 1"
+                )
+            if len(sub_type) > 32:
+                errors.append(
+                    f"{prefix} Member must have length less than or equal to 32"
+                )
+            if _SUBTYPE_RE.fullmatch(sub_type) is None:
+                errors.append(
+                    f"{prefix} Member must satisfy regular expression pattern: {SUBTYPE_PATTERN}"
+                )
+
+        if errors:
+            reported = errors[:_MAX_VALIDATION_ERRORS]
+            count = len(reported)
+            noun = "error" if count == 1 else "errors"
+            raise ValidationException(
+                f"{count} validation {noun} detected: {'; '.join(reported)}"
+            )
 
     @staticmethod
     def _validate_conflicting_execution_update(updates: list[OperationUpdate]) -> None:
