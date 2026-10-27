@@ -22,9 +22,7 @@ from aws_durable_execution_sdk_python_testing.runner import DurableFunctionTestR
         ("x" * 33, "Member must have length less than or equal to 32"),
     ],
 )
-def test_invalid_step_subtype_fails_execution(
-    sub_type: str, constraint: str
-) -> None:
+def test_invalid_step_subtype_fails_execution(sub_type: str, constraint: str) -> None:
     reached_after_step: list[bool] = []
 
     @durable_step

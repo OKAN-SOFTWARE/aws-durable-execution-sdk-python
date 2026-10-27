@@ -140,10 +140,7 @@ def test_rejects_whole_checkpoint_without_mutating_execution() -> None:
 
 
 def test_model_validation_caps_reported_errors_at_ten() -> None:
-    updates = [
-        _update("x" * 33, operation_id=f"step-{index}")
-        for index in range(12)
-    ]
+    updates = [_update("x" * 33, operation_id=f"step-{index}") for index in range(12)]
     with pytest.raises(AwsApiException) as exc_info:
         CheckpointValidator.validate_input(updates, _execution())
     message = str(exc_info.value)

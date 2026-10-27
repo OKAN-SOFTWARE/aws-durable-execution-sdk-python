@@ -3,6 +3,8 @@
 import datetime
 from unittest.mock import Mock
 
+import pytest
+from aws_durable_execution_sdk_python.exceptions import CheckpointError
 from aws_durable_execution_sdk_python.lambda_service import (
     CheckpointOutput,
     OperationAction,
@@ -12,6 +14,7 @@ from aws_durable_execution_sdk_python.lambda_service import (
 )
 
 from aws_durable_execution_sdk_python_testing.client import InMemoryServiceClient
+from aws_durable_execution_sdk_python_testing.exceptions import ValidationException
 from aws_durable_execution_sdk_python_testing.worker.registry import ExecutionRegistry
 
 
@@ -50,6 +53,20 @@ def test_checkpoint():
     processor.process_checkpoint.assert_called_once_with(
         "token", updates, "client-token"
     )
+
+
+def test_checkpoint_validation_error_is_non_retryable():
+    """Local model validation has the same terminal behavior as HTTP 400."""
+    processor = Mock()
+    processor.process_checkpoint.side_effect = ValidationException(
+        "Value 'bad subtype' at 'updates.1.member.subType' failed validation"
+    )
+    client = _client(processor)
+
+    with pytest.raises(CheckpointError, match="updates.1.member.subType") as exc_info:
+        client.checkpoint("execution-arn", "token", [], None)
+
+    assert not exc_info.value.is_retryable()
 
 
 def test_get_execution_state():

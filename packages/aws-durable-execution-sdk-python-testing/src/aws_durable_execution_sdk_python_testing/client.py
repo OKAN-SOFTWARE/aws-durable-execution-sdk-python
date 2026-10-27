@@ -2,6 +2,10 @@
 
 import datetime
 
+from aws_durable_execution_sdk_python.exceptions import (
+    CheckpointError,
+    DurableApiErrorCategory,
+)
 from aws_durable_execution_sdk_python.lambda_service import (
     CheckpointOutput,
     DurableServiceClient,
@@ -10,6 +14,7 @@ from aws_durable_execution_sdk_python.lambda_service import (
 )
 
 from aws_durable_execution_sdk_python_testing.clock import real_now
+from aws_durable_execution_sdk_python_testing.exceptions import ValidationException
 from aws_durable_execution_sdk_python_testing.checkpoint.processor import (
     CheckpointProcessor,
 )
@@ -41,7 +46,13 @@ class InMemoryServiceClient(DurableServiceClient):
         task = CheckpointTask(
             self._checkpoint_processor, checkpoint_token, updates, client_token
         )
-        return self._registry.submit(durable_execution_arn, task).result()
+        try:
+            return self._registry.submit(durable_execution_arn, task).result()
+        except ValidationException as exc:
+            # Match the boto client: service-model 400s terminate the execution.
+            raise CheckpointError(
+                str(exc), error_category=DurableApiErrorCategory.EXECUTION
+            ) from exc
 
     def get_execution_state(
         self,
