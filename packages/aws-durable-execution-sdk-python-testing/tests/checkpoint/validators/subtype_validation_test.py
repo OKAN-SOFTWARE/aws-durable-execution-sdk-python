@@ -92,28 +92,41 @@ def test_invalid_subtype_is_rejected_with_service_errors(
     with pytest.raises(AwsApiException) as exc_info:
         CheckpointValidator.validate_input([_update(sub_type)], _execution())
     message = str(exc_info.value)
-    assert message.startswith(f"{len(constraints)} validation error")
-    for constraint in constraints:
-        assert (
+    expected_errors = [
+        (
             f"Value '{sub_type}' at 'updates.1.member.subType' "
             f"failed to satisfy constraint: {constraint}"
-        ) in message
+        )
+        for constraint in constraints
+    ]
+    noun = "error" if len(expected_errors) == 1 else "errors"
+    expected = (
+        f"{len(expected_errors)} validation {noun} detected: "
+        + "; ".join(expected_errors)
+    )
+    assert message == expected
     response = HTTPResponse.create_error_from_exception(exc_info.value)
     assert response.status_code == 400
     assert response.body == {"__type": "ValidationException", "message": message}
 
 
 def test_multiple_invalid_updates_report_in_input_order() -> None:
+    oversized = "x" * 33
     updates = [
         _update("order charge", operation_id="step-1"),
-        _update("x" * 33, operation_id="step-2"),
+        _update(oversized, operation_id="step-2"),
     ]
     with pytest.raises(AwsApiException) as exc_info:
         CheckpointValidator.validate_input(updates, _execution())
     message = str(exc_info.value)
-    assert message.startswith("2 validation errors detected:")
-    assert message.index("updates.1.member.subType") < message.index(
-        "updates.2.member.subType"
+    assert message == (
+        "2 validation errors detected: "
+        "Value 'order charge' at 'updates.1.member.subType' "
+        "failed to satisfy constraint: "
+        f"Member must satisfy regular expression pattern: {PATTERN}; "
+        f"Value '{oversized}' at 'updates.2.member.subType' "
+        "failed to satisfy constraint: "
+        "Member must have length less than or equal to 32"
     )
 
 

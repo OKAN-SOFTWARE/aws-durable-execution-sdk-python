@@ -579,7 +579,7 @@ class OperationUpdate:
             action=OperationAction(data["Action"]),
             parent_id=data.get("ParentId"),
             name=data.get("Name"),
-            sub_type=data.get("SubType") or None,
+            sub_type=data.get("SubType"),
             payload=data.get("Payload"),
             error=error,
             context_options=context_options,

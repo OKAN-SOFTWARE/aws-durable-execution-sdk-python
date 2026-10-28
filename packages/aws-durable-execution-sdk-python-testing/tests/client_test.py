@@ -4,7 +4,10 @@ import datetime
 from unittest.mock import Mock
 
 import pytest
-from aws_durable_execution_sdk_python.exceptions import CheckpointError
+from aws_durable_execution_sdk_python.exceptions import (
+    CheckpointError,
+    DurableApiErrorCategory,
+)
 from aws_durable_execution_sdk_python.lambda_service import (
     CheckpointOutput,
     OperationAction,
@@ -67,6 +70,8 @@ def test_checkpoint_validation_error_is_non_retryable():
         client.checkpoint("execution-arn", "token", [], None)
 
     assert not exc_info.value.is_retryable()
+    assert exc_info.value.error_category is DurableApiErrorCategory.EXECUTION
+    assert isinstance(exc_info.value.__cause__, ValidationException)
 
 
 def test_get_execution_state():

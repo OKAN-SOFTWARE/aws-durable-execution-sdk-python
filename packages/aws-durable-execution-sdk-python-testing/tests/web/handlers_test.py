@@ -13,6 +13,9 @@ from aws_durable_execution_sdk_python.lambda_service import (
     OperationType,
 )
 
+from aws_durable_execution_sdk_python_testing.checkpoint.validators.checkpoint import (
+    CheckpointValidator,
+)
 from aws_durable_execution_sdk_python_testing.exceptions import (
     AwsApiException,
     IllegalArgumentException,
@@ -796,6 +799,76 @@ def test_checkpoint_durable_execution_handler_success():
     updates = call_args[0][2]
     assert len(updates) == 1
     assert updates[0].operation_id == "op-1"
+
+
+def test_checkpoint_durable_execution_handler_rejects_empty_wire_subtype():
+    """An explicit empty SubType must survive parsing and return HTTP 400."""
+    executor = Mock()
+    handler = CheckpointDurableExecutionHandler(executor)
+
+    def validate_request(_arn, _token, updates, _client_token):
+        # Invoke the real validator on the updates produced by the HTTP parser.
+        CheckpointValidator.validate_input(updates, Mock())
+
+    executor.checkpoint_execution.side_effect = validate_request
+    typed_route = Router().find_route(
+        "/2025-12-01/durable-executions/test-arn/checkpoint", "POST"
+    )
+    request = HTTPRequest(
+        method="POST",
+        path=typed_route,
+        headers={"Content-Type": "application/json"},
+        query_params={},
+        body={
+            "CheckpointToken": "original-token",
+            "Updates": [
+                {"Id": "step-1", "Type": "STEP", "Action": "START", "SubType": ""}
+            ],
+        },
+    )
+
+    response = handler.handle(typed_route, request)
+
+    assert response.status_code == 400
+    assert response.body == {
+        "__type": "ValidationException",
+        "message": (
+            "2 validation errors detected: "
+            "Value '' at 'updates.1.member.subType' failed to satisfy constraint: "
+            "Member must have length greater than or equal to 1; "
+            "Value '' at 'updates.1.member.subType' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [a-zA-Z0-9-_]+"
+        ),
+    }
+    executor.checkpoint_execution.assert_called_once()
+    assert executor.checkpoint_execution.call_args.args[2][0].sub_type == ""
+
+
+def test_checkpoint_durable_execution_handler_allows_missing_wire_subtype():
+    """An omitted optional SubType still deserializes to None."""
+    executor = Mock()
+    handler = CheckpointDurableExecutionHandler(executor)
+    executor.checkpoint_execution.return_value = CheckpointDurableExecutionResponse(
+        checkpoint_token="next-token", new_execution_state=None
+    )
+    typed_route = Router().find_route(
+        "/2025-12-01/durable-executions/test-arn/checkpoint", "POST"
+    )
+    request = HTTPRequest(
+        method="POST",
+        path=typed_route,
+        headers={"Content-Type": "application/json"},
+        query_params={},
+        body={
+            "CheckpointToken": "original-token",
+            "Updates": [{"Id": "step-1", "Type": "STEP", "Action": "START"}],
+        },
+    )
+
+    response = handler.handle(typed_route, request)
+
+    assert response.status_code == 200
+    assert executor.checkpoint_execution.call_args.args[2][0].sub_type is None
 
 
 def test_checkpoint_durable_execution_handler_invalid_request():
